@@ -3,9 +3,15 @@ import time
 import torch
 import torch.nn as nn
 
-from gptq import *
+from gptq_2stage_2_multiround_EMA import *
+# gptq_2stage_1
+# gptq_2stage_2_multiround_EMA
+# gptq_2stage_3_multiround_flip
 from modelutils import *
 from quant import *
+
+# Cache directory for models and datasets
+CACHE_DIR = '/data2/user/quyiyang/.cache'
 
 
 def get_llama(model):
@@ -16,7 +22,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto', cache_dir=CACHE_DIR)
     model.seqlen = 2048
     return model
 
@@ -62,6 +68,7 @@ def llama_sequential(model, dataloader, dev):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
+    fp_inps = inps.clone()
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
@@ -71,6 +78,22 @@ def llama_sequential(model, dataloader, dev):
     for i in range(len(layers)):
         layer = layers[i].to(dev)
         full = find_layers(layer)
+
+        # Capture full-precision inputs for cross-layer error compensation (R matrix)
+        fp_cache = {}
+        def capture_fp(name):
+            def hook(module, inp, out):
+                if name not in fp_cache:
+                    fp_cache[name] = []
+                fp_cache[name].append(inp[0].data.clone())
+            return hook
+        fp_handles = []
+        for name in full:
+            fp_handles.append(full[name].register_forward_hook(capture_fp(name)))
+        for j in range(args.nsamples):
+            fp_inps[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        for h in fp_handles:
+            h.remove()
 
         if args.true_sequential:
             sequential = [
@@ -92,6 +115,7 @@ def llama_sequential(model, dataloader, dev):
                 gptq[name].quantizer.configure(
                     args.wbits, perchannel=True, sym=args.sym, mse=False
                 )
+                gptq[name].fp_inp = fp_cache[name]
 
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -109,7 +133,8 @@ def llama_sequential(model, dataloader, dev):
                 print(i, name)
                 print('Quantizing ...')
                 gptq[name].fasterquant(
-                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups
+                    percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups,
+                    stage1_hessian=args.stage1_hessian
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
@@ -280,6 +305,10 @@ if __name__ == '__main__':
         help='Whether to perform symmetric quantization.'
     )
     parser.add_argument(
+        '--stage1_hessian', action='store_true',
+        help='Use Hessian-weighted grid search in Stage 1 (and dynamic groups).'
+    )
+    parser.add_argument(
         '--save', type=str, default='',
         help='Save quantized checkpoint under this name.'
     )
@@ -314,9 +343,9 @@ if __name__ == '__main__':
         quantizers = llama_sequential(model, dataloader, DEV)
         print(time.time() - tick)
 
-    datasets = ['wikitext2', 'ptb', 'c4'] 
+    datasets = ['wikitext2', 'c4']
     if args.new_eval:
-        datasets = ['wikitext2', 'ptb-new', 'c4-new']
+        datasets = ['wikitext2', 'c4-new']
     for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen

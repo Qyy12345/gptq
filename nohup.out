@@ -1,0 +1,14 @@
+usage: llama.py [-h] [--seed SEED] [--nsamples NSAMPLES] [--percdamp PERCDAMP]
+                [--nearest] [--wbits {2,3,4,8,16}] [--groupsize GROUPSIZE]
+                [--sym] [--stage1_hessian] [--save SAVE] [--new-eval]
+                [--act-order] [--true-sequential] [--static-groups]
+                model {wikitext2,ptb,c4}
+llama.py: error: argument --groupsize: expected one argument
+CUDA extension not installed.
+usage: llama.py [-h] [--seed SEED] [--nsamples NSAMPLES] [--percdamp PERCDAMP]
+                [--nearest] [--wbits {2,3,4,8,16}] [--groupsize GROUPSIZE]
+                [--sym] [--stage1_hessian] [--save SAVE] [--new-eval]
+                [--act-order] [--true-sequential] [--static-groups]
+                model {wikitext2,ptb,c4}
+llama.py: error: the following arguments are required: dataset
+CUDA extension not installed.

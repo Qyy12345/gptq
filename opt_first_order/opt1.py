@@ -1,9 +1,10 @@
+import math
 import time
 
 import torch
 import torch.nn as nn
 
-from gptq_2stage import *
+from gptq1 import *
 from modelutils import *
 from quant import *
 
@@ -23,20 +24,84 @@ def get_opt(model):
     model.seqlen = model.config.max_position_embeddings
     return model
 
+
+# ======================================================================
+# Phase 0: Global Gradient Harvesting & CPU Offloading (TS-PTQ)
+# ======================================================================
+def harvest_gradients_opt(model, dataloader, dev):
+    """
+    Phase 0: Run full forward+backward passes on the unquantized FP16 model
+    using the calibration dataset. Accumulate weight gradients sample-by-sample,
+    average them, and offload to CPU memory for later use during quantization.
+
+    Strategy: Space-for-Time — gradients are pre-computed and stored on CPU,
+    then fetched layer-by-layer during quantization to prevent OOM.
+
+    Returns:
+        dict: Mapping from parameter name (e.g. 'model.decoder.layers.0.self_attn.q_proj.weight')
+              to averaged gradient tensor on CPU.
+    """
+    print('Phase 0: Harvesting global gradients (TS-PTQ)...')
+
+    # Save model state for restoration
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    # Move entire model to GPU for forward+backward pass
+    print('  Moving model to GPU for gradient computation...')
+    model.to(dev)
+
+    grad_accum = {}
+    count = 0
+
+    for batch in dataloader:
+        model.zero_grad()
+        input_ids = batch[0].to(dev)
+
+        # Forward + backward with gradient tracking
+        with torch.enable_grad():
+            outputs = model(input_ids, labels=input_ids)
+            loss = outputs.loss
+
+        loss.backward()
+
+        # Accumulate weight gradients on CPU (FP32 for numerical precision)
+        for name, param in model.named_parameters():
+            if param.grad is not None and 'weight' in name:
+                if name not in grad_accum:
+                    grad_accum[name] = torch.zeros_like(param.data, device='cpu').float()
+                grad_accum[name] += param.grad.data.float().cpu()
+
+        count += 1
+
+    # Average gradients over all samples
+    for name in grad_accum:
+        grad_accum[name] /= count
+
+    # Move model back to CPU and clean up GPU memory
+    model.cpu()
+    model.zero_grad()
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+    print(f'Phase 0 complete. Collected gradients for {len(grad_accum)} weight parameters over {count} samples.')
+    return grad_accum
+
+
 @torch.no_grad()
-def opt_sequential(model, dataloader, dev):
+def opt_sequential(model, dataloader, dev, global_grads=None):
     print('Starting ...')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.decoder.layers
 
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev) 
+    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
+        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -72,7 +137,6 @@ def opt_sequential(model, dataloader, dev):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    fp_inps = inps.clone()
     attention_mask = cache['attention_mask']
 
     print('Ready.')
@@ -90,24 +154,6 @@ def opt_sequential(model, dataloader, dev):
                 args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
             )
 
-        # Capture full-precision inputs for cross-layer error compensation (R matrix)
-        fp_cache = {}
-        def capture_fp(name):
-            def hook(module, inp, out):
-                if name not in fp_cache:
-                    fp_cache[name] = []
-                fp_cache[name].append(inp[0].data.clone())
-            return hook
-        fp_handles = []
-        for name in subset:
-            fp_handles.append(subset[name].register_forward_hook(capture_fp(name)))
-        for j in range(args.nsamples):
-            fp_inps[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        for h in fp_handles:
-            h.remove()
-        for name in subset:
-            gptq[name].fp_inp = fp_cache[name]
-
         def add_batch(name):
             def tmp(_, inp, out):
                 gptq[name].add_batch(inp[0].data, out.data)
@@ -123,9 +169,18 @@ def opt_sequential(model, dataloader, dev):
         for name in subset:
             print(i, name)
             print('Quantizing ...')
+
+            # Fetch the global gradient for this specific layer from CPU dict
+            grad_key = 'model.decoder.layers.%d.%s.weight' % (i, name)
+            g = global_grads.get(grad_key, None) if global_grads is not None else None
+            if g is not None:
+                print(f'  TS-PTQ: Using global gradient for {grad_key}')
+            else:
+                print(f'  TS-PTQ: No gradient found for {grad_key}, using standard GPTQ.')
+
             gptq[name].fasterquant(
-                percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups,
-                stage1_hessian=args.stage1_hessian
+                percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order,
+                static_groups=args.static_groups, g_global=g
             )
             quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptq[name].quantizer
             gptq[name].free()
@@ -134,13 +189,13 @@ def opt_sequential(model, dataloader, dev):
 
         layers[i] = layer.cpu()
         del layer
-        del gptq 
+        del gptq
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    
+
     return quantizers
 
 @torch.no_grad()
@@ -157,9 +212,9 @@ def opt_eval(model, testenc, dev):
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
+        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -269,9 +324,9 @@ def load_quant3(model, checkpoint):
     config = OPTConfig.from_pretrained(model, cache_dir=CACHE_DIR)
     def noop(*args, **kwargs):
         pass
-    torch.nn.init.kaiming_uniform_ = noop 
-    torch.nn.init.uniform_ = noop 
-    torch.nn.init.normal_ = noop 
+    torch.nn.init.kaiming_uniform_ = noop
+    torch.nn.init.uniform_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
@@ -406,7 +461,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--nearest', action='store_true',
         help='Whether to run the RTN baseline.'
-    ) 
+    )
     parser.add_argument(
         '--wbits', type=int, default=16, choices=[2, 3, 4, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
@@ -422,10 +477,6 @@ if __name__ == '__main__':
     parser.add_argument(
         '--sym', action='store_true',
         help='Whether to perform symmetric quantization.'
-    )
-    parser.add_argument(
-        '--stage1_hessian', action='store_true',
-        help='Use Hessian-weighted grid search in Stage 1 (and dynamic groups).'
     )
     parser.add_argument(
         '--save', type=str, default='',
@@ -459,8 +510,21 @@ if __name__ == '__main__':
         '--static-groups', action='store_true',
         help='Whether to use static groups; recommended when using `--actorder` for more efficient inference.'
     )
+    # TS-PTQ specific flags
+    parser.add_argument(
+        '--tsptq', action='store_true', default=True,
+        help='Whether to use TS-PTQ (Target-Shifted PTQ) with gradient correction. Default: True.'
+    )
+    parser.add_argument(
+        '--no-tsptq', action='store_true',
+        help='Disable TS-PTQ, use standard GPTQ instead.'
+    )
 
     args = parser.parse_args()
+
+    # Handle TS-PTQ flag
+    if args.no_tsptq:
+        args.tsptq = False
 
     if args.load:
         model = load_quant3(args.model, args.load)
@@ -473,8 +537,13 @@ if __name__ == '__main__':
     )
 
     if args.wbits < 16 and not args.nearest:
+        # Phase 0: Global Gradient Harvesting (TS-PTQ)
+        global_grads = None
+        if args.tsptq:
+            global_grads = harvest_gradients_opt(model, dataloader, DEV)
+
         tick = time.time()
-        quantizers = opt_sequential(model, dataloader, DEV)
+        quantizers = opt_sequential(model, dataloader, DEV, global_grads=global_grads)
         print(time.time() - tick)
 
     if args.benchmark:
@@ -492,7 +561,7 @@ if __name__ == '__main__':
     datasets = [args.dataset]  # Use only the specified dataset
     if args.new_eval:
       datasets = [args.dataset]
-    for dataset in datasets: 
+    for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
@@ -501,4 +570,4 @@ if __name__ == '__main__':
 
     if args.save:
         opt_pack3(model, quantizers)
-        torch.save(model.state_dict(), args.save) 
+        torch.save(model.state_dict(), args.save)

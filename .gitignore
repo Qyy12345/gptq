@@ -1,7 +1,81 @@
-__pycache__
-build
-dist
-opt175b
-*.txt
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyTorch
+*.pth
 *.pt
-*egg-info*
+*.ckpt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Model files (very large)
+models/
+*.safetensors
+*.bin
+*.msgpack
+*.h5
+
+# Dataset cache
+data/
+*.json.gz
+
+# Quantized checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Logs
+*.log
+logs/
+wandb/
+runs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Cache
+.cache/
+*.cache
+__pycache__/
+.pytest_cache/
+
+# HuggingFace cache
+.huggingface/
+
+# Temporary files
+tmp/
+temp/
+*.tmp

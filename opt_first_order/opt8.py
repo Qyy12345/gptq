@@ -1,9 +1,11 @@
+import math
 import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from gptq_2stage import *
+from gptq2_2 import *
 from modelutils import *
 from quant import *
 
@@ -23,20 +25,148 @@ def get_opt(model):
     model.seqlen = model.config.max_position_embeddings
     return model
 
+
+# ========== TS-PTQ Step 1: Pre-compute g_global and alpha_vec ==========
+@torch.enable_grad()
+def precompute_tsptq_gradients(model, dataloader, dev):
+    """
+    Run a full forward/backward pass on the FP16 model using the calibration
+    dataset to compute per-layer g_global and alpha_vec for TS-PTQ.
+
+    Returns:
+        g_global_dict:  dict mapping layer full-name -> Tensor [out_features, in_features]
+        alpha_vec_dict: dict mapping layer full-name -> Tensor [out_features, 1]
+    """
+    print('TS-PTQ: Pre-computing gradients (Plan D: Structural Tikhonov Regularization) ...')
+    model.to(dev)
+
+    # Enable requires_grad on embedding parameters so the computation graph
+    # is built and backward hooks on downstream layers will fire.
+    embedding_layer = model.get_input_embeddings()
+    orig_requires_grad = {}
+    for name_p, param in embedding_layer.named_parameters():
+        orig_requires_grad[name_p] = param.requires_grad
+        param.requires_grad_(True)
+
+    # Discover every Linear layer in the model
+    all_linear_layers = find_layers(model, layers=[nn.Linear])
+
+    # Accumulators (accumulated on CPU to save GPU memory)
+    g_global_accum = {n: 0.0 for n in all_linear_layers}
+    grad_y_sq_accum  = {n: 0.0 for n in all_linear_layers}
+    token_count      = {n: 0   for n in all_linear_layers}
+    input_cache      = {}
+
+    # ---------- hooks ----------
+    def make_forward_hook(name):
+        def hook(module, inp, out):
+            input_cache[name] = inp[0].detach()
+        return hook
+
+    def make_backward_hook(name):
+        def hook(module, grad_input, grad_output):
+            grad_y = grad_output[0]
+            if grad_y is None:
+                return
+            x = input_cache.get(name, None)
+            if x is None:
+                return
+
+            # Reshape to 2-D: [N_tokens, features]
+            grad_y_2d = grad_y.reshape(-1, grad_y.shape[-1]).float()   # [N, out_features]
+            x_2d      = x.reshape(-1, x.shape[-1]).float()             # [N, in_features]
+
+            N_tok = grad_y_2d.shape[0]
+            # Fix: undo cross_entropy mean reduction to get true per-token gradient
+            grad_y_per_token = grad_y_2d * N_tok
+
+            # Accumulate expected gradient (sum over tokens)
+            g_global_accum[name] = g_global_accum[name] + (grad_y_per_token.t() @ x_2d).cpu()
+
+            # Accumulate expected squared gradient over tokens for alpha_vec
+            grad_y_sq_accum[name] = grad_y_sq_accum[name] + grad_y_per_token.pow(2).sum(0).cpu()
+            token_count[name]     = token_count[name] + N_tok
+        return hook
+
+    handles = []
+    for name, layer in all_linear_layers.items():
+        handles.append(layer.register_forward_hook(make_forward_hook(name)))
+        handles.append(layer.register_full_backward_hook(make_backward_hook(name)))
+
+    # ---------- forward / backward passes ----------
+    for batch in dataloader:
+        model.zero_grad()
+        input_ids = batch[0].to(dev)
+
+        outputs = model(input_ids)
+        # Next-token prediction loss
+        shift_logits = outputs.logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+        loss.backward()
+
+    # ---------- remove hooks ----------
+    for h in handles:
+        h.remove()
+
+    # ---------- build result dictionaries ----------
+    result_g_global  = {}
+    result_alpha_vec = {}
+
+    for name in all_linear_layers:
+        n = token_count[name]
+        if n == 0: n = 1
+
+        # 1. 严格的 token-level g_global
+        result_g_global[name] = g_global_accum[name] / n
+
+        # 2. 计算当前层的方差向量 (lambda_vec)
+        grad_y_mean_sq = grad_y_sq_accum[name] / n
+
+        # === 方案 D 核心：结构化 Tikhonov 阻尼 ===
+        # 提取当前层梯度方差的中位数，作为该层的"特征尺度"
+        layer_var_median = torch.median(grad_y_mean_sq)
+        
+        # 设定动态阻尼系数 (参考 GPTQ 的 percdamp，这里设为中位数的 1%)
+        # 1e-12 仅作为底层计算机浮点保护，防止出现绝对 0
+        gamma_ratio = 0.01 
+        gamma_dynamic = gamma_ratio * layer_var_median + 1e-12
+        
+        # 使用自适应底噪计算 alpha_vec，彻底杜绝极小方差引发的数值爆炸
+        alpha_final = 1.0 / (grad_y_mean_sq + gamma_dynamic)
+        # ==========================================
+
+        result_alpha_vec[name] = alpha_final.unsqueeze(1).cpu()  # [out_features, 1]
+
+    # ---------- cleanup ----------
+    for name_p, param in embedding_layer.named_parameters():
+        param.requires_grad_(orig_requires_grad[name_p])
+    model.zero_grad()
+    model.cpu()
+    torch.cuda.empty_cache()
+
+    print(f'TS-PTQ: Pre-computed gradients for {len(result_g_global)} layers.')
+    return result_g_global, result_alpha_vec
+# =====================================================================
+
+
 @torch.no_grad()
-def opt_sequential(model, dataloader, dev):
+def opt_sequential(model, dataloader, dev, g_global_dict=None, alpha_vec_dict=None):
     print('Starting ...')
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.decoder.layers
 
-    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev) 
+    model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
+        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -72,7 +202,6 @@ def opt_sequential(model, dataloader, dev):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    fp_inps = inps.clone()
     attention_mask = cache['attention_mask']
 
     print('Ready.')
@@ -90,24 +219,6 @@ def opt_sequential(model, dataloader, dev):
                 args.wbits, perchannel=True, sym=args.sym, mse=False, trits=args.trits
             )
 
-        # Capture full-precision inputs for cross-layer error compensation (R matrix)
-        fp_cache = {}
-        def capture_fp(name):
-            def hook(module, inp, out):
-                if name not in fp_cache:
-                    fp_cache[name] = []
-                fp_cache[name].append(inp[0].data.clone())
-            return hook
-        fp_handles = []
-        for name in subset:
-            fp_handles.append(subset[name].register_forward_hook(capture_fp(name)))
-        for j in range(args.nsamples):
-            fp_inps[j] = layer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
-        for h in fp_handles:
-            h.remove()
-        for name in subset:
-            gptq[name].fp_inp = fp_cache[name]
-
         def add_batch(name):
             def tmp(_, inp, out):
                 gptq[name].add_batch(inp[0].data, out.data)
@@ -123,9 +234,15 @@ def opt_sequential(model, dataloader, dev):
         for name in subset:
             print(i, name)
             print('Quantizing ...')
+
+            # TS-PTQ: fetch pre-computed data for this layer
+            layer_key = 'model.decoder.layers.%d.%s' % (i, name)
+            _g_global  = g_global_dict.get(layer_key, None)  if g_global_dict  is not None else None
+            _alpha_vec = alpha_vec_dict.get(layer_key, None) if alpha_vec_dict is not None else None
+
             gptq[name].fasterquant(
                 percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, static_groups=args.static_groups,
-                stage1_hessian=args.stage1_hessian
+                g_global=_g_global, alpha_vec=_alpha_vec,
             )
             quantizers['model.decoder.layers.%d.%s' % (i, name)] = gptq[name].quantizer
             gptq[name].free()
@@ -134,13 +251,13 @@ def opt_sequential(model, dataloader, dev):
 
         layers[i] = layer.cpu()
         del layer
-        del gptq 
+        del gptq
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    
+
     return quantizers
 
 @torch.no_grad()
@@ -157,9 +274,9 @@ def opt_eval(model, testenc, dev):
     model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
     model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
     if hasattr(model.model.decoder, 'project_out') and model.model.decoder.project_out:
-        model.model.decoder.project_out = model.model.decoder.project_out.to(dev) 
+        model.model.decoder.project_out = model.model.decoder.project_out.to(dev)
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
-        model.model.decoder.project_in = model.model.decoder.project_in.to(dev) 
+        model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -269,9 +386,9 @@ def load_quant3(model, checkpoint):
     config = OPTConfig.from_pretrained(model, cache_dir=CACHE_DIR)
     def noop(*args, **kwargs):
         pass
-    torch.nn.init.kaiming_uniform_ = noop 
-    torch.nn.init.uniform_ = noop 
-    torch.nn.init.normal_ = noop 
+    torch.nn.init.kaiming_uniform_ = noop
+    torch.nn.init.uniform_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
@@ -406,7 +523,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--nearest', action='store_true',
         help='Whether to run the RTN baseline.'
-    ) 
+    )
     parser.add_argument(
         '--wbits', type=int, default=16, choices=[2, 3, 4, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
@@ -422,10 +539,6 @@ if __name__ == '__main__':
     parser.add_argument(
         '--sym', action='store_true',
         help='Whether to perform symmetric quantization.'
-    )
-    parser.add_argument(
-        '--stage1_hessian', action='store_true',
-        help='Use Hessian-weighted grid search in Stage 1 (and dynamic groups).'
     )
     parser.add_argument(
         '--save', type=str, default='',
@@ -473,9 +586,17 @@ if __name__ == '__main__':
     )
 
     if args.wbits < 16 and not args.nearest:
+        # TS-PTQ Step 1: Pre-compute g_global and alpha_vec
+        g_global_dict, alpha_vec_dict = precompute_tsptq_gradients(model, dataloader, DEV)
+
+        # TS-PTQ Step 2: Run quantization with pre-computed shift data
         tick = time.time()
-        quantizers = opt_sequential(model, dataloader, DEV)
+        quantizers = opt_sequential(model, dataloader, DEV, g_global_dict, alpha_vec_dict)
         print(time.time() - tick)
+
+        # Free pre-computed data
+        del g_global_dict, alpha_vec_dict
+        torch.cuda.empty_cache()
 
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
@@ -492,7 +613,7 @@ if __name__ == '__main__':
     datasets = [args.dataset]  # Use only the specified dataset
     if args.new_eval:
       datasets = [args.dataset]
-    for dataset in datasets: 
+    for dataset in datasets:
         dataloader, testloader = get_loaders(
             dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
         )
@@ -501,4 +622,4 @@ if __name__ == '__main__':
 
     if args.save:
         opt_pack3(model, quantizers)
-        torch.save(model.state_dict(), args.save) 
+        torch.save(model.state_dict(), args.save)

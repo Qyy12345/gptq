@@ -9,6 +9,11 @@ def quantize(x, scale, zero, maxq):
     q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
     return scale * (q - zero)
 
+def quantize_int(x, scale, zero, maxq):
+    """Return centered integer grid point (q_int - zero) without dequantization."""
+    q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+    return q - zero
+
 class Quantizer(nn.Module):
 
     def __init__(self, shape=1):
@@ -20,7 +25,7 @@ class Quantizer(nn.Module):
     def configure(
         self,
         bits, perchannel=False, sym=True, 
-        mse=False, norm=2.4, grid=100, maxshrink=.8,
+        mse=True, norm=2.4, grid=100, maxshrink=.8,
         trits=False
     ):
         self.maxq = torch.tensor(2 ** bits - 1)
@@ -115,6 +120,66 @@ class Quantizer(nn.Module):
         if len(shape) == 2:
             self.scale = self.scale.unsqueeze(0)
             self.zero = self.zero.unsqueeze(0)
+
+    def find_params_hessian_weighted(self, x, H_block):
+        """
+        Find optimal per-channel scale and zero using Hessian-weighted MSE
+        grid search.  Supports both sym=True and sym=False.
+        Does NOT modify self.scale / self.zero.
+
+        Args:
+            x:        [d_out, g]   weight slice for one group
+            H_block:  [g, g]       Hessian diagonal block for this group
+
+        Returns:
+            scale:    [d_out]      optimal per-channel scale factor
+            zero:     [d_out]      optimal per-channel zero-point
+        """
+        dev = x.device
+        maxq = self.maxq.to(dev)
+
+        tmp = torch.zeros(x.shape[0], device=dev)
+        xmin = torch.minimum(x.min(1)[0], tmp)
+        xmax = torch.maximum(x.max(1)[0], tmp)
+
+        if self.sym:
+            xmax = torch.maximum(torch.abs(xmin), xmax)
+            tmp = xmin < 0
+            if torch.any(tmp):
+                xmin[tmp] = -xmax[tmp]
+        tmp = (xmin == 0) & (xmax == 0)
+        xmin[tmp] = -1
+        xmax[tmp] = +1
+
+        scale = (xmax - xmin) / maxq
+        if self.sym:
+            zero = torch.full_like(scale, (maxq + 1) / 2)
+        else:
+            zero = torch.round(-xmin / scale)
+
+        # Grid search: sweep scale from 100% down to (1 - maxshrink) * 100%,
+        # minimizing the Hessian-weighted reconstruction error per channel.
+        best = torch.full([x.shape[0]], float('inf'), device=dev)
+        for i in range(int(self.maxshrink * self.grid)):
+            p = 1 - i / self.grid
+            xmin1 = p * xmin
+            xmax1 = p * xmax
+            scale1 = (xmax1 - xmin1) / maxq
+            zero1 = torch.round(-xmin1 / scale1) if not self.sym else zero
+
+            q = quantize(x, scale1.unsqueeze(1), zero1.unsqueeze(1), maxq)
+            diff = q - x                                          # [d_out, g]
+            # Quadratic form: diff @ H_block @ diff^T  (batched over channels)
+            err = (diff @ H_block * diff).sum(1)                  # [d_out]
+
+            tmp = err < best
+            if torch.any(tmp):
+                best[tmp] = err[tmp]
+                scale[tmp] = scale1[tmp]
+                if not self.sym:
+                    zero[tmp] = zero1[tmp]
+
+        return scale, zero
 
     def quantize(self, x):
         if self.ready():

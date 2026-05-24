@@ -7,7 +7,10 @@ import transformers
 
 from quant import *
 
-DEBUG = True 
+
+DEBUG = True
+
+
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -57,7 +60,8 @@ class GPTQ:
         self.H += inp.matmul(inp.t())
 
     def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False ,stage1_hessian=False
+        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False,
+        g_global=None, alpha_vec=None
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -99,9 +103,91 @@ class GPTQ:
         H[diag, diag] += damp
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
-        # H = (H + H.T) / 2
+        # ========== TS-PTQ: Intercept the True Inverse ==========
+        H_inv_true = H.clone()
+        # ===========================================================
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+
+        # ========== TS-PTQ: Newton Pre-shift (v2.2 — Vector-Preserving Trust Region) ==========
+        if g_global is not None and alpha_vec is not None:
+            g_global = g_global.to(self.dev)
+            alpha_vec = alpha_vec.to(self.dev)
+
+            # TS-PTQ alpha_vec statistics
+            print(
+                'TS-PTQ alpha_vec  '
+                f'mean={alpha_vec.mean().item():.6e}  '
+                f'std={alpha_vec.std().item():.6e}  '
+                f'min={alpha_vec.min().item():.6e}  '
+                f'max={alpha_vec.max().item():.6e}  '
+                f'shape={list(alpha_vec.shape)}'
+            )
+
+            if actorder:
+                g_global = g_global[:, perm]
+
+            # 1. Compute the raw Newton direction
+            newton_dir = torch.matmul(g_global, H_inv_true)  # [out_features, in_features]
+
+            # 2. Compute the proposed optimal shift
+            v_proposed = -alpha_vec * newton_dir  # [out_features, in_features]
+
+            # ---------- Vector-Preserving Trust Region ----------
+            # 3. Obtain the Quantization Scale (S)
+            S = self.quantizer.scale  # broadcasts as [out_features, 1]
+
+            # 4. Sub-grid safety margin
+            tau = 0.5
+            safe_limit = tau * S
+
+            # 5. Max shift magnitude per output channel (L_inf norm)
+            max_shift = torch.max(torch.abs(v_proposed), dim=1, keepdim=True).values  # [out_features, 1]
+
+            # 6. Proportional scale factor (< 1 only when exceeding safe_limit)
+            scale_factor = torch.clamp(safe_limit / (max_shift + 1e-8), max=1.0)  # [out_features, 1]
+
+            # 7. Execute Perfect Proportional Truncation
+            v_safe = v_proposed * scale_factor  # [out_features, in_features]
+
+            # 8. Apply the final target shift
+            W = W + v_safe  # W is now W_target
+            # -----------------------------------------------------
+
+            # Diagnostics: how many rows were actually clipped?
+            clipped = (scale_factor < 1.0).sum().item()
+            print(
+                'Trust Region  '
+                f'clipped_rows={clipped}/{scale_factor.shape[0]}  '
+                f'scale_factor_mean={scale_factor.mean().item():.6f}  '
+                f'scale_factor_min={scale_factor.min().item():.6f}'
+            )
+
+            # Re-compute quantization parameters based on shifted W_target
+            self.quantizer.find_params(W, weight=True)
+
+            # Re-compute static groups on W_target if applicable
+            if static_groups:
+                import copy
+                groups = []
+
+                # Fix: temporarily undo actorder permutation so groups are
+                # computed on the correct physical channel boundaries
+                W_unpermuted = W.clone()
+                if actorder:
+                    W_unpermuted[:, perm] = W.clone()
+
+                for i in range(0, self.columns, groupsize):
+                    quantizer = copy.deepcopy(self.quantizer)
+                    quantizer.find_params(W_unpermuted[:, i:(i + groupsize)], weight=True)
+                    groups.append(quantizer)
+                del W_unpermuted
+
+            # Memory cleanup
+            del g_global, alpha_vec, H_inv_true, newton_dir, v_proposed, v_safe, S, safe_limit, max_shift, scale_factor
+        else:
+            del H_inv_true
+        # ===========================================================
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -145,19 +231,21 @@ class GPTQ:
             if DEBUG:
                 self.layer.weight.data[:, :i2] = Q[:, :i2]
                 self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2).item())
-                print(torch.sum(Losses).item())
+                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+                print(torch.sum(Losses))
 
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
-        print('loss', torch.sum((self.layer(self.inp1) - self.out1) ** 2).item())
         print('error', torch.sum(Losses).item())
+
         if actorder:
             Q = Q[:, invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if DEBUG:
+            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
     def free(self):
         if DEBUG:

@@ -9,10 +9,12 @@ def set_seed(seed):
 
 def get_wikitext2(nsamples, seed, seqlen, model):
     from datasets import load_dataset
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    # 使用本地已有的 parquet 文件，避免网络下载
+    local_path = '/data2/user/quyiyang/.cache/huggingface/hub/datasets--wikitext/snapshots/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-2-raw-v1'
+    traindata = load_dataset('parquet', data_files=f'{local_path}/train-00000-of-00001.parquet', split='train')
+    testdata = load_dataset('parquet', data_files=f'{local_path}/test-00000-of-00001.parquet', split='train')
 
-    from transformers import AutoTokenizer 
+    from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
     trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
@@ -52,13 +54,26 @@ def get_ptb(nsamples, seed, seqlen, model):
     return trainloader, testenc
 
 def get_c4(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    )
-    valdata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-    )
+    from datasets import load_dataset, Dataset
+    import os
+
+    # 使用本地已有的数据文件，避免网络下载
+    local_c4_path = '/data2/user/quyiyang/.cache/huggingface/datasets/json'
+    train_file = f'{local_c4_path}/allenai--c4-7b83bfaf0a7139e0/0.0.0/c90812beea906fcffe0d5e3bb9eba909a80a998b5f88e9f8acbd320aa91acfde/json-train.arrow'
+    val_file = f'{local_c4_path}/allenai--c4-9f0a6f05857732de/0.0.0/c90812beea906fcffe0d5e3bb9eba909a80a998b5f88e9f8acbd320aa91acfde/json-validation.arrow'
+
+    if os.path.exists(train_file):
+        # 使用本地 arrow 文件
+        traindata = Dataset.from_file(train_file)
+        valdata = Dataset.from_file(val_file)
+    else:
+        # 回退到网络下载
+        traindata = load_dataset(
+            'allenai/c4', 'en', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
+        )
+        valdata = load_dataset(
+            'allenai/c4', 'en', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+        )
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)

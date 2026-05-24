@@ -7,7 +7,10 @@ import transformers
 
 from quant import *
 
-DEBUG = True 
+
+DEBUG = True
+
+
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -57,7 +60,8 @@ class GPTQ:
         self.H += inp.matmul(inp.t())
 
     def fasterquant(
-        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False ,stage1_hessian=False
+        self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False,
+        g_global=None, alpha_vec=None
     ):
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
@@ -99,9 +103,114 @@ class GPTQ:
         H[diag, diag] += damp
         H = torch.linalg.cholesky(H)
         H = torch.cholesky_inverse(H)
-        # H = (H + H.T) / 2
+        # ========== TS-PTQ: Intercept the True Inverse ==========
+        H_inv_true = H.clone()
+        # ===========================================================
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
+
+        # ========== TS-PTQ: Newton Pre-shift ==========
+        if g_global is not None and alpha_vec is not None:
+            g_global = g_global.to(self.dev)
+            alpha_vec = alpha_vec.to(self.dev)
+
+            if actorder:
+                g_global = g_global[:, perm]
+
+            # --- Distribution dumps before Newton shift ---
+            # |g_global|
+            gg = g_global.abs()
+            print(
+                'TS-PTQ |g_global|   '
+                f'mean={gg.mean().item():.6e}  std={gg.std().item():.6e}  '
+                f'min={gg.min().item():.6e}  max={gg.max().item():.6e}  '
+                f'median={gg.median().item():.6e}  shape={list(gg.shape)}'
+            )
+            del gg
+
+            # |W| (before shift)
+            Wabs = W.abs()
+            print(
+                'TS-PTQ |W|          '
+                f'mean={Wabs.mean().item():.6e}  std={Wabs.std().item():.6e}  '
+                f'min={Wabs.min().item():.6e}  max={Wabs.max().item():.6e}  '
+                f'median={Wabs.median().item():.6e}  shape={list(Wabs.shape)}'
+            )
+            del Wabs
+
+            # |diag(H^{-1})|
+            diag_Hinv = H_inv_true.diag().abs()
+            print(
+                'TS-PTQ |diag(H^-1)| '
+                f'mean={diag_Hinv.mean().item():.6e}  std={diag_Hinv.std().item():.6e}  '
+                f'min={diag_Hinv.min().item():.6e}  max={diag_Hinv.max().item():.6e}  '
+                f'median={diag_Hinv.median().item():.6e}  len={diag_Hinv.numel()}'
+            )
+            del diag_Hinv
+
+            # 1. Matrix multiplication using the TRUE inverse
+            newton_direction = torch.matmul(g_global, H_inv_true)  # shape: [out_features, in_features]
+
+            # |newton_direction|
+            nd = newton_direction.abs()
+            print(
+                'TS-PTQ |newton_dir| '
+                f'mean={nd.mean().item():.6e}  std={nd.std().item():.6e}  '
+                f'min={nd.min().item():.6e}  max={nd.max().item():.6e}  '
+                f'median={nd.median().item():.6e}  shape={list(nd.shape)}'
+            )
+            del nd
+
+            # alpha_vec
+            print(
+                'TS-PTQ alpha_vec    '
+                f'mean={alpha_vec.mean().item():.6e}  std={alpha_vec.std().item():.6e}  '
+                f'min={alpha_vec.min().item():.6e}  max={alpha_vec.max().item():.6e}  '
+                f'median={alpha_vec.median().item():.6e}  shape={list(alpha_vec.shape)}'
+            )
+
+            # 2. Channel-wise scaling to get the final offset v
+            scale = - 2.0  # manually adjustable scale factor
+            v = scale * alpha_vec * newton_direction  # shape: [out_features, in_features]
+
+            # |v| (shift magnitude)
+            vabs = v.abs()
+            print(
+                'TS-PTQ |v|          '
+                f'mean={vabs.mean().item():.6e}  std={vabs.std().item():.6e}  '
+                f'min={vabs.min().item():.6e}  max={vabs.max().item():.6e}  '
+                f'median={vabs.median().item():.6e}  shape={list(vabs.shape)}'
+            )
+            del vabs
+
+            # Create target weights
+            W = W + v  # W is now W_target
+
+            # Re-compute quantization parameters based on shifted W_target
+            self.quantizer.find_params(W, weight=True)
+
+            # Re-compute static groups on W_target if applicable
+            if static_groups:
+                import copy
+                groups = []
+
+                # Fix: temporarily undo actorder permutation so groups are
+                # computed on the correct physical channel boundaries
+                W_unpermuted = W.clone()
+                if actorder:
+                    W_unpermuted[:, perm] = W.clone()
+
+                for i in range(0, self.columns, groupsize):
+                    quantizer = copy.deepcopy(self.quantizer)
+                    quantizer.find_params(W_unpermuted[:, i:(i + groupsize)], weight=True)
+                    groups.append(quantizer)
+                del W_unpermuted
+
+            # Memory cleanup
+            del g_global, alpha_vec, H_inv_true, newton_direction, v
+        else:
+            del H_inv_true
+        # ===========================================================
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -145,19 +254,21 @@ class GPTQ:
             if DEBUG:
                 self.layer.weight.data[:, :i2] = Q[:, :i2]
                 self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2).item())
-                print(torch.sum(Losses).item())
+                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
+                print(torch.sum(Losses))
 
         torch.cuda.synchronize()
         print('time %.2f' % (time.time() - tick))
-        print('loss', torch.sum((self.layer(self.inp1) - self.out1) ** 2).item())
         print('error', torch.sum(Losses).item())
+
         if actorder:
             Q = Q[:, invperm]
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
+        if DEBUG:
+            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
 
     def free(self):
         if DEBUG:

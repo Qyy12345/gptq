@@ -5,9 +5,12 @@ import torch
 import torch.nn as nn
 import transformers
 
-from gptq import * 
+from gptq import *
 from modelutils import *
 from quant import *
+
+# Cache directory for models and datasets
+CACHE_DIR = '/data2/user/quyiyang/.cache'
 
 
 def get_bloom(model):
@@ -18,7 +21,7 @@ def get_bloom(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import BloomForCausalLM
-    model = BloomForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = BloomForCausalLM.from_pretrained(model, torch_dtype='auto', cache_dir=CACHE_DIR)
     model.seqlen = 2048
     return model
 
