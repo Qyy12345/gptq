@@ -15,9 +15,9 @@
 CUDA_VISIBLE_DEVICES=0 nohup python llama.py models/llama-2-7b-hf wikitext2 --wbits 2 --groupsize 64 --stage1_hessian >log_2stage_64/wikitext/llama-2-7b/2bit/r0.log 2>&1 &
 
 #### 可调方法与参数
-在llama.py的开头调整要用的量化策略：
-  from gptq_2stage import *可改成：
-  gptq_2stage_2_multiround_EMA
-  gptq_2stage_3_multiround_flip
+在llama.py的开头调整要用的量化策略：  
+  from gptq_2stage import *可改成：  
+  gptq_2stage_2_multiround_EMA  
+  gptq_2stage_3_multiround_flip  
 
 用gptq_2stage_2_multiround_EMA时在该文件开头调整EMA轮数和参数alpha大小
